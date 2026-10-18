@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Rendered per sidecar by install-sidecar.sh (a plain file, so no systemd-vs-bash
+# double escaping can corrupt an argument; regenerated on every install).
+# Text-only SGLang engine for /v1/systemone (issue #42). Runs beside the serving
+# lane: no CUDA graphs, a small pinned context/token budget, and no speculation,
+# so its fixed footprint stays small and it never sizes a pool the lane depends on.
+set -euo pipefail
+
+MODEL="__SIDECAR_MODEL__"
+REV="__SIDECAR_REV__"
+QUANT_ARGS=(__SIDECAR_QUANT_ARGS__)
+NAME="__SIDECAR_NAME__"
+PORT=__SIDECAR_PORT__
+CTX="__SIDECAR_CTX__"
+MAXTOK="__SIDECAR_MAXTOK__"
+MEMFR="__SIDECAR_MEM_FRACTION__"
+MAXRUN="__SIDECAR_MAX_RUNNING_REQUESTS__"
+MAMBA="__SIDECAR_MAX_MAMBA_CACHE_SIZE__"
+
+avail_kib() { awk '/MemAvailable/{print $2}' /proc/meminfo; }
+echo "$NAME: host MemAvailable at launch $(( $(avail_kib) / 1048576 )) GiB"
+__SIDECAR_SECRETS_CALL__
+
+exec /usr/bin/docker run --rm --name __SIDECAR_CONTAINER__ --gpus all \
+  --memory 12g --memory-swap 12g --shm-size 2g --network host --ipc=host \
+  -v __HF_CACHE__:/root/.cache/huggingface \
+  -v __CONFIG_DIR__:/out \
+  -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  -e HF_HUB_OFFLINE=1 \
+  -e SGLANG_VLM_CACHE_SIZE_MB=0 \
+  __IMAGE__ \
+  python3 -m sglang.launch_server \
+    --model-path "$MODEL" --revision "$REV" --tp-size 1 \
+    --served-model-name "$NAME" \
+    "${QUANT_ARGS[@]}" \
+    --language-only \
+    --page-size 64 \
+    --mem-fraction-static "$MEMFR" \
+    --max-total-tokens "$MAXTOK" \
+    --context-length "$CTX" \
+    --chunked-prefill-size 2048 \
+    --max-running-requests "$MAXRUN" \
+    --max-mamba-cache-size "$MAMBA" \
+    --disable-cuda-graph \
+    --disable-flashinfer-autotune \
+    --enable-metrics \
+    __SIDECAR_CONF_ARGS__ \
+    --host 127.0.0.1 --port "$PORT"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Keepalive proxy in front of SGLang (v6.36). No content logging, and the only
+"""Keepalive proxy in front of SGLang (v6.37). No content logging, and the only
 rewriting is the tool-schema guard (role 4); one route, POST /v1/systemone, is answered
 here instead of relayed (role 5).
 
@@ -33,12 +33,27 @@ Six roles, nothing else:
    from the lane behind it: one single-token completion per question, the option
    labels read off top_logprobs, so a pipeline or an agent gets choice, score and
    yes/no probabilities from the model it already runs, with nothing generated and
-   nothing parsed. The "System One endpoint" section below carries the design and
-   its receipts;
+   nothing parsed. A call named after a sidecar from the sidecars file goes whole to
+   that engine's own /v1/systemone, its answer verbatim (v6.37): the sidecar speaks the
+   contract itself, and the lane takes no part. The "System One endpoint" section below
+   carries the design and its receipts;
 6. keep a request through an engine restart: one that arrives while the engine does not
    answer and its unit (PROXY_HOLD_UNITS) is on its way back waits for it, at most
    PROXY_HOLD_MAX_S, instead of failing at once. A streamed one hears from the proxy at
    once (200, then the keepalives of role 1); see "Holding a request" below.
+
+v6.37: POST /v1/systemone routes by the model it is named. A call whose model field
+names a sidecar from the sidecars file (~/.config/qwen38/sidecars, one "<served name>
+<base url>" line per sidecar, written by install-sidecar.sh; QWEN38_SIDECARS_FILE moves
+the file) goes to that engine's own /v1/systemone whole, and the sidecar's answer comes
+back as it is: since v0.5.21 a small SGLang engine serves the endpoint on its own, so the
+proxy adds no readout to this path and touches the lane it fronts not at all - not even
+for an admission slot, so sidecar traffic can neither starve the lane's typed decisions
+nor earn them a 529 the lane never earned. A sidecar that is not running answers with the
+lane's own 503 engine_unavailable, with the sidecar named; its own 4xx are wrapped in this
+route's envelope the way the lane's are; a 502/503/504 is read as a sidecar starting or
+shutting down, any other 5xx as the sidecar's refusal with its own code. Every other model
+name still goes to the lane, and is refused by it as before.
 
 v6.36: a path under /ready passes the door without a key, as the engine leaves it open (its
 auth rule opens /health, /ready and /metrics; the door had /health and /metrics only, so a
@@ -1578,6 +1593,39 @@ def _is_prompt_route(route):
 # spends 17 + about 7 output tokens per option of a Choice inside (2,412 for 255
 # options); this path spends one token per question whatever the option count.
 SYSTEMONE_PATH = "/v1/systemone"
+
+# Sidecar routing for /v1/systemone (v6.37). The sidecars are small Qwen engines on
+# their own ports (install-sidecar.sh, issue #42) that serve /v1/systemone themselves
+# on SGLang's own core, since v0.5.21. The mapping is the box's, not this file's: one
+# "<served name> <base url>" line per sidecar, written by install-sidecar.sh, '#'
+# starts a comment. QWEN38_SIDECARS_FILE moves the file for tests. A line that does
+# not parse is skipped with a banner line: the sidecars are an option, and a typo in
+# one must not stop the box's main lane from starting.
+SIDECARS_FILE = os.environ.get("QWEN38_SIDECARS_FILE", "").strip() or \
+    os.path.expanduser("~/.config/qwen38/sidecars")
+
+
+def _load_sidecars(path):
+    sidecars = {}
+    try:
+        with open(path) as f:
+            lines = f.readlines()
+    except Exception:
+        return sidecars
+    for line in lines:
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) != 2 or not parts[1].startswith(("http://", "https://")):
+            print(f"[proxy] {path}: {line!r} is not '<name> <url>'; skipped", flush=True)
+            continue
+        sidecars[parts[0]] = parts[1].rstrip("/")
+    return sidecars
+
+
+SIDECARS = _load_sidecars(SIDECARS_FILE)
+
 # Sub-requests in flight for ONE call, and across every call at once. The lanes serve
 # 4 (flash) or 8 (27B) running requests; a fan-out wider than that only queues at the
 # engine while it starves the clients the lane exists for. Both are eight, so one caller
@@ -2359,6 +2407,51 @@ def systemone_model(requested):
         return names[0] if requested in SYSTEMONE_ALIASES else requested
     raise SystemOneUsage(f"Unknown model: {requested}", plain=False)
 
+
+
+def systemone_sidecar_call(name, url, body, auth):
+    """The whole /v1/systemone request to one sidecar engine (v6.37): (status,
+    body_bytes, retry_after). The sidecar is a full SGLang serving this same wire
+    contract, so a 200 answer is relayed verbatim; its 4xx are wrapped in this
+    route's envelope with the sidecar named; a 502/503/504 is read as a sidecar
+    starting or shutting down and comes back as the lane's 503 engine_unavailable
+    with Retry-After; any other 5xx is the sidecar's refusal, wrapped with its own
+    code. A sidecar that does not answer at all raises EngineUnreachable; one that
+    waits out SYSTEMONE_TIMEOUT_S raises SystemOneUpstream, busy, not gone."""
+    headers = {"Content-Type": "application/json"}
+    if auth:
+        headers["Authorization"] = auth
+    req = urllib.request.Request(url + "/v1/systemone", data=body,
+                                 headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=SYSTEMONE_TIMEOUT_S) as r:
+            return r.status, r.read(), None
+    except urllib.error.HTTPError as herr:
+        if herr.code in (502, 503, 504):
+            return 503, json.dumps({"detail": {"error_type": "engine_unavailable", "message":
+                f"keepalive-proxy: the sidecar {name} behind {url} answered HTTP {herr.code}, "
+                f"as it does while starting or shutting down; this request was NOT refused "
+                f"for its size. Retry it unchanged once GET {url}/health answers 200."}}).encode(), "30"
+        message = None
+        try:
+            err = json.loads(herr.read().decode())
+            message = err.get("message") if isinstance(err, dict) else None
+        except Exception:
+            pass
+        return herr.code, json.dumps({"detail": {"error_type": "engine_error", "message":
+            f"keepalive-proxy: the sidecar {name} behind {url} refused the call with HTTP "
+            f"{herr.code}" + (f": {message}" if message else "")}}).encode(), None
+    except (socket.timeout, TimeoutError) as e:
+        raise SystemOneUpstream(f"the sidecar {name} did not answer within "
+                                f"{SYSTEMONE_TIMEOUT_S:.0f}s (SYSTEMONE_TIMEOUT_S); busy, not gone") from e
+    except http.client.HTTPException as e:
+        raise EngineUnreachable(f"the sidecar {name} cut the answer mid-body ({type(e).__name__})") from e
+    except (urllib.error.URLError, OSError) as e:
+        reason = getattr(e, "reason", None)
+        if isinstance(reason, (socket.timeout, TimeoutError)):
+            raise SystemOneUpstream(f"the sidecar {name} did not answer within "
+                                    f"{SYSTEMONE_TIMEOUT_S:.0f}s (SYSTEMONE_TIMEOUT_S); busy, not gone") from e
+        raise EngineUnreachable(str(reason or e)) from e
 
 def systemone_guard(plan):
     """The oversize guard of the relay path, applied to the longest branch: a prompt
@@ -3705,8 +3798,24 @@ class H(BaseHTTPRequestHandler):
         list, 400 for what parses and cannot be served); the engine's own refusals are
         relayed as they are; a dead engine is the same 503 the relay path gives; past
         SYSTEMONE_MAX_CALLS in progress the door answers 529 with Retry-After. Design
-        and receipts in the "System One endpoint" section."""
+        and receipts in the "System One endpoint" section. A call named after a sidecar
+        goes whole to that engine's own /v1/systemone, before the admission (v6.37): the
+        sidecar keeps its own queue, and its traffic must not take the lane's slots."""
         json_hdr = {"Content-Type": "application/json"}
+        if SIDECARS:
+            # The routing check reads the body once more, and only on a box with
+            # sidecars configured; a body that does not parse just falls through to
+            # the lane, whose own refusal answers it.
+            model, url = None, None
+            try:
+                model = json.loads(body).get("model")
+                if isinstance(model, str):
+                    url = SIDECARS.get(model)
+            except Exception:
+                pass
+            if url:
+                self._systemone_sidecar(model, url, body, json_hdr)
+                return
         # The slot goes back to the door it was taken from, whatever _systemone_calls names by
         # then: rebound while a call was in flight (tests do it), the new door was credited
         # with a slot it never gave, and served a call it had to refuse (2026-10-08).
@@ -3843,6 +3952,43 @@ class H(BaseHTTPRequestHandler):
                 f"label on the weakest question; the prompt or the chat template is not being read as a decision")
         self._plain(status, headers, out)
         self._done("ok systemone")
+
+    def _systemone_sidecar(self, name, url, body, json_hdr):
+        """POST /v1/systemone named after a sidecar (v6.37): the body goes to that
+        engine whole and its answer comes back as it is, the contract it serves
+        itself. The lane this proxy fronts takes no part in the call - no admission
+        slot, no fan-out, not even a pool read - so a sidecar cannot starve the
+        lane's typed decisions, and a sidecar that is not running is answered with
+        the lane's own dead-engine 503, with the sidecar named instead of the lane."""
+        auth = _upstream_auth(self)
+        try:
+            status, out, retry = systemone_sidecar_call(name, url, body, auth)
+        except EngineUnreachable as e:
+            log(f"{self._peer} systemone sidecar {name} unreachable: {_so_logsafe(e)}")
+            self._plain(503, {**json_hdr, "Retry-After": "30"},
+                        json.dumps({"detail": {"error_type": "engine_unavailable", "message":
+                                               f"keepalive-proxy: the sidecar {name} behind {url} is not answering "
+                                               f"({_so_logsafe(e)}); this request was NOT refused for its size. "
+                                               f"Retry it unchanged once GET {url}/health answers 200."}}).encode())
+            self._done("503 sidecar unreachable"); return
+        except SystemOneUpstream as e:
+            log(f"{self._peer} systemone sidecar {name} upstream: {_so_logsafe(e)}")
+            self._plain(502, json_hdr,
+                        json.dumps({"detail": {"error_type": "upstream_error",
+                                               "message": f"keepalive-proxy: {e}"}}).encode())
+            self._done("502 sidecar upstream"); return
+        except Exception as e:
+            log(f"{self._peer} systemone sidecar {name} FAILED: {type(e).__name__}: {_so_logsafe(e)}")
+            self._plain(500, json_hdr, json.dumps({"detail": {"error_type": "proxy_error", "message":
+                        f"keepalive-proxy: this call failed inside the proxy ({type(e).__name__}); "
+                        f"the sidecar is not implicated"}}).encode())
+            self._done("500 sidecar failed"); return
+        headers = dict(json_hdr)
+        if retry:
+            headers["Retry-After"] = retry
+        log(f"{self._peer} systemone sidecar {name} -> {status}")
+        self._plain(status, headers, out)
+        self._done(f"ok systemone sidecar {name}")
 
     def _handle(self, with_body):
         """Every request leaves exactly one end line in the journal, even when the
@@ -3982,7 +4128,9 @@ if __name__ == "__main__":
     holds = (f"holds requests up to {HOLD_MAX_S:.0f}s while {' or '.join(HOLD_UNITS)} comes back"
              if HOLD_UNITS and HOLD_MAX_S > 0 else "holds nothing")
     # one f-string: the cockpit's tests render this line from the source
-    log(f"v6.36 on {BIND}:{port} -> {UPSTREAM} (keepalive {KEEPALIVE_S:.0f}s, max silence {MAX_SILENCE_S:.0f}s, {holds})")
+    log(f"v6.37 on {BIND}:{port} -> {UPSTREAM} (keepalive {KEEPALIVE_S:.0f}s, max silence {MAX_SILENCE_S:.0f}s, {holds})")
+    if SIDECARS:
+        log("systemone sidecars: " + ", ".join(f"{n} -> {u}" for n, u in SIDECARS.items()))
     if FLASH_PROMPT_CEILING_TOKENS > 0:
         log(f"one-prompt ceiling {FLASH_PROMPT_CEILING_TOKENS} tokens while the flash lane serves"
             + (f", {PROMPT_CEILING_TOKENS} on any lane" if PROMPT_CEILING_TOKENS > 0 else ""))

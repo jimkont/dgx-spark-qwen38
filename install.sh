@@ -447,6 +447,10 @@ WITH_FLASH=0
 NO_FLASH=0
 WITH_27B=0
 NO_27B=0
+WITH_SIDECAR_TINY=0
+NO_SIDECAR_TINY=0
+WITH_SIDECAR_SMALL=0
+NO_SIDECAR_SMALL=0
 for arg in "$@"; do
   case "$arg" in
     --no-start) NO_START=1 ;;
@@ -463,6 +467,10 @@ for arg in "$@"; do
     --no-flash) NO_FLASH=1 ;;
     --with-27b) WITH_27B=1 ;;
     --no-27b) NO_27B=1 ;;
+    --with-sidecar-tiny) WITH_SIDECAR_TINY=1 ;;
+    --no-sidecar-tiny) NO_SIDECAR_TINY=1 ;;
+    --with-sidecar-small) WITH_SIDECAR_SMALL=1 ;;
+    --no-sidecar-small) NO_SIDECAR_SMALL=1 ;;
     --with-claude-warmup)
       echo "NOTE: --with-claude-warmup was removed in v1.3 (the repo's client story moved to opencode)."
       echo "      The flag is ignored; an installed warmup drop-in from an earlier version is cleaned up." ;;
@@ -472,6 +480,8 @@ Usage: ./install.sh [--no-start] [--no-service] [--no-opencode | --with-opencode
                    [--no-cockpit | --with-cockpit] [--no-image | --with-image]
                    [--no-video | --with-video] [--no-flash | --with-flash]
                    [--no-27b | --with-27b]
+                   [--no-sidecar-tiny | --with-sidecar-tiny]
+                   [--no-sidecar-small | --with-sidecar-small]
 
 Run it as yourself. Never with sudo in front: it calls sudo itself for the
 privileged steps, and under sudo every path it writes moves to /root (see the
@@ -513,6 +523,14 @@ without a terminal.
   --no-27b              leave the 27B lane out when it is not the one serving
                         (54 GB), remembered the same way
   --with-27b            bring it back after a --no-27b
+  --no-sidecar-tiny     leave the 0.8B /v1/systemone sidecar out (:30011, about
+                        10 GiB of the unified pool). It is off by default; the
+                        choice is remembered by later runs
+  --with-sidecar-tiny   install the 0.8B sidecar (Qwen3.5-0.8B, its BF16 weights)
+  --no-sidecar-small    leave the 2B /v1/systemone sidecar out (:30010, about
+                        10 GiB), remembered the same way
+  --with-sidecar-small  install the 2B sidecar (Qwen3.5-2B NVFP4, the export
+                        docs/sidecar.md recommends for this endpoint)
 
 Re-running over an existing install keeps the operator's choices: the target
 model (any of the seven), the context mode (native/1m), the flash serving tier,
@@ -982,6 +1000,12 @@ fi
 if [ "$NO_27B" -eq 1 ] && [ "$WITH_27B" -eq 1 ]; then
   printf -- '--no-27b and --with-27b contradict each other (drop one flag)\n' >&2; exit 1
 fi
+if [ "$NO_SIDECAR_TINY" -eq 1 ] && [ "$WITH_SIDECAR_TINY" -eq 1 ]; then
+  printf -- '--no-sidecar-tiny and --with-sidecar-tiny contradict each other (drop one flag)\n' >&2; exit 1
+fi
+if [ "$NO_SIDECAR_SMALL" -eq 1 ] && [ "$WITH_SIDECAR_SMALL" -eq 1 ]; then
+  printf -- '--no-sidecar-small and --with-sidecar-small contradict each other (drop one flag)\n' >&2; exit 1
+fi
 
 # --no-start and --no-service both return before the image step, so the flag would be
 # accepted and silently do nothing. Say so here rather than at the end of a long install.
@@ -993,6 +1017,12 @@ fi
 if [ "$WITH_VIDEO" -eq 1 ] && { [ "$NO_START" -eq 1 ] || [ "$NO_SERVICE" -eq 1 ]; }; then
   printf -- '--with-video needs the full install: it installs a systemd unit and proves it serves.\n' >&2
   printf -- 'Run ./install.sh without --no-start/--no-service, or ./install-video.sh on its own.\n' >&2
+  exit 1
+fi
+# The sidecar installers build systemd units too; same refusal as the lanes.
+if { [ "$WITH_SIDECAR_TINY" -eq 1 ] || [ "$WITH_SIDECAR_SMALL" -eq 1 ]; } && { [ "$NO_START" -eq 1 ] || [ "$NO_SERVICE" -eq 1 ]; }; then
+  printf -- '--with-sidecar-* needs the full install: it installs a systemd unit and proves it serves.\n' >&2
+  printf -- 'Run ./install.sh without --no-start/--no-service, or ./install-sidecar.sh on its own.\n' >&2
   exit 1
 fi
 # Since v1.12 the cockpit is part of a plain install: the one-liner has to leave
@@ -1039,6 +1069,26 @@ if [ -z "$SECONDARY" ]; then
   lane_wanted flash "$NO_FLASH" "$WITH_FLASH"; WANT_FLASH="$WANT"
   lane_wanted 27b "$NO_27B" "$WITH_27B"; WANT_27B="$WANT"
 fi
+# The /v1/systemone sidecars (issue #42) are opt-in, the inverse of the lanes: off
+# unless a --with-sidecar-* was passed or remembered in a marker file. They are
+# systemd units, so a --no-service install skips them (a marker, if written, persists
+# for the next service install; the refusal above covers the flag under --no-service).
+sc_wanted(){  # $1 marker (sidecar-tiny|sidecar-small), $2 --no given, $3 --with given: sets WANT
+  local mark="$CONFIG_DIR/$1.on"
+  WANT=0
+  if [ "$3" -eq 1 ]; then
+    WANT=1
+    mkdir -p "$CONFIG_DIR"
+    [ -f "$mark" ] || printf 'enabled with ./install.sh --with-%s on %s\n' "$1" "$(date -u +%Y-%m-%dT%H:%MZ)" > "$mark"
+  elif [ "$2" -eq 1 ]; then
+    rm -f "$mark"
+  elif [ -f "$mark" ]; then
+    WANT=1
+  fi
+}
+WANT_SIDECAR_TINY=0; WANT_SIDECAR_SMALL=0
+sc_wanted sidecar-tiny "$NO_SIDECAR_TINY" "$WITH_SIDECAR_TINY"; WANT_SIDECAR_TINY="$WANT"
+sc_wanted sidecar-small "$NO_SIDECAR_SMALL" "$WITH_SIDECAR_SMALL"; WANT_SIDECAR_SMALL="$WANT"
 
 if [ "$NO_SERVICE" -eq 1 ] && [ "$CONTEXT_MODE" = "1m" ]; then
   if [ -z "$_ENV_CONTEXT_MODE" ]; then
@@ -2625,6 +2675,30 @@ except Exception as e:
         echo "NOTE: the video lane did not install (the lines above say why); the rest goes on."
       fi
     fi
+    # The /v1/systemone sidecars (issue #42) are opt-in and built to coexist with
+    # the running lane, so they skip the stop-and-prove dance: each boots beside
+    # it and proves itself with a /v1/systemone call. They install separately,
+    # with the quantization each was benched with: the 2B ships the NVFP4 export
+    # docs/sidecar.md recommends for this endpoint, the 0.8B its BF16 weights.
+    SIDE_TINY_STATE=off; SIDE_SMALL_STATE=off
+    if [ "$WANT_SIDECAR_TINY" -eq 1 ]; then
+      step "Sidecar lane qwen38-sidecar-tiny (0.8B, :30011, issue #42)"
+      if "$REPO_DIR/install-sidecar.sh" --tiny; then
+        SIDE_TINY_STATE=installed
+      else
+        SIDE_TINY_STATE=failed
+        echo "NOTE: the 0.8B sidecar did not install (the lines above say why); the rest goes on."
+      fi
+    fi
+    if [ "$WANT_SIDECAR_SMALL" -eq 1 ]; then
+      step "Sidecar lane qwen38-sidecar-small (2B NVFP4, :30010, issue #42)"
+      if "$REPO_DIR/install-sidecar.sh" --small --quant nvfp4; then
+        SIDE_SMALL_STATE=installed
+      else
+        SIDE_SMALL_STATE=failed
+        echo "NOTE: the 2B sidecar did not install (the lines above say why); the rest goes on."
+      fi
+    fi
     # What to prove: what this run installed for the first time, or what was asked for
     # by name (--with-<lane>, which also proves a lane already there).
     SECOND_WITH=0
@@ -2736,6 +2810,25 @@ except Exception as e:
     fi
     lane_line "Images     " "$IMAGE_STATE" image image "40 GB" /etc/systemd/system/qwen38-image.service
     lane_line "Videos     " "$VIDEO_STATE" video video "144 GB" /etc/systemd/system/qwen38-video.service
+    # The sidecars are not switchable lanes: they run beside the lane or they do not.
+    sidecar_line(){  # $1 label, $2 state, $3 port, $4 the sidecar's own name
+      case "$2" in
+        installed)
+          case "$4" in
+            tiny)  m=qwen3.5-0.8b-sidecar ;;
+            small) m=qwen3.5-2b-sidecar ;;
+          esac
+          echo "  $1: installed, serving /v1/systemone on 127.0.0.1:$3; the proxy routes calls named $m to it" ;;
+        failed)    echo "  $1: NOT ready, see its NOTE above; ./install-sidecar.sh retries what it did" ;;
+        off)       if [ -f "/etc/systemd/system/qwen38-sidecar-$4.service" ]; then
+                     echo "  $1: installed from an earlier run, untouched; ./install.sh --with-sidecar-$4 updates it"
+                   else
+                     echo "  $1: not installed; ./install.sh --with-sidecar-$4 adds it (issue #42)"
+                   fi ;;
+      esac
+    }
+    sidecar_line "Sidecar 0.8B" "$SIDE_TINY_STATE" 30011 tiny
+    sidecar_line "Sidecar 2B   " "$SIDE_SMALL_STATE" 30010 small
     [ "$LANE" = "27b" ] && echo "  Benchmark  : ./bench.sh"
     exit 0
   fi

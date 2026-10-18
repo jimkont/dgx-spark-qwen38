@@ -32,6 +32,7 @@ import os
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -191,8 +192,56 @@ def _serve(handler):
     return srv
 
 
+class Sidecar(http.server.BaseHTTPRequestHandler):
+    """The fake sidecar engine (v6.37): it answers /v1/systemone itself, the way
+    a small SGLang serves it natively, with the Jev contract body, and records
+    the request it was given, so a test can check that the proxy forwarded the
+    caller's body whole and that the main engine never saw the call."""
+    protocol_version = "HTTP/1.1"
+    lock = threading.Lock()
+    seen = []
+    status = 200
+    ok_body = {"model": "qwen3.5-test-sidecar",
+               "answers": {"department": {"type": "choice", "choice": "billing",
+                                           "confidence": 0.7,
+                                           "probabilities": {"billing": 0.7, "technical": 0.2,
+                                                             "sales": 0.1}},
+                           "frustration": {"type": "score", "score": 2, "confidence": 0.6,
+                                           "probabilities": {"1": 0.1, "2": 0.6, "3": 0.3}},
+                           "is_urgent": {"type": "noul", "noul": "yes", "confidence": 0.8,
+                                         "probabilities": {"yes": 0.8, "no": 0.2}}},
+               "usage": {"input_tokens": 40, "output_tokens": 3}}
+    err_body = {"message": "sidecar's own refusal"}
+
+    def log_message(self, *a):
+        pass
+
+    def _send(self, status, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length") or "0")
+        raw = self.rfile.read(n)
+        with self.lock:
+            self.seen.append({"path": self.path, "body": raw,
+                              "auth": self.headers.get("Authorization")})
+        if self.path != "/v1/systemone":
+            self._send(404, {"error": "no such route"})
+            return
+        if self.status == 200:
+            self._send(200, self.ok_body)
+        else:
+            self._send(self.status, self.err_body)
+
+
 class SystemOne(unittest.TestCase):
-    ENV_TOUCHED = ("UPSTREAM", "SYSTEMONE_WARM_CHARS", "QWEN38_CLIENT_KEYS_FILE")
+    ENV_TOUCHED = ("UPSTREAM", "SYSTEMONE_WARM_CHARS", "QWEN38_CLIENT_KEYS_FILE",
+                   "QWEN38_SIDECARS_FILE")
 
     @classmethod
     def setUpClass(cls):
@@ -205,6 +254,12 @@ class SystemOne(unittest.TestCase):
         os.environ["UPSTREAM"] = f"http://127.0.0.1:{cls.engine.server_port}"
         os.environ["SYSTEMONE_WARM_CHARS"] = "400"
         os.environ.pop("QWEN38_CLIENT_KEYS_FILE", None)
+        # The sidecars table (v6.37) is read from a file at import time: pin it to an
+        # empty file so a real one on the box (or in CI) cannot leak into these tests;
+        # the sidecar tests install their own mapping on cls.mod.SIDECARS.
+        cls.sidecars_file = Path(tempfile.mkdtemp(prefix="kproxy-sidecars-")) / "sidecars"
+        cls.sidecars_file.write_text("")
+        os.environ["QWEN38_SIDECARS_FILE"] = str(cls.sidecars_file)
         spec = importlib.util.spec_from_file_location("kproxy_systemone", REPO / "keepalive-proxy.py")
         cls.mod = importlib.util.module_from_spec(spec)
         sys.argv = ["keepalive-proxy.py"]
@@ -249,6 +304,8 @@ class SystemOne(unittest.TestCase):
         Engine.poison = None
         Engine.wide = None
         Engine.aborted = []
+        Sidecar.seen = []
+        Sidecar.status = 200
         self.mod._SERVED.update(names=(), ts=0.0)
         self.mod.invalidate_pool()
 
@@ -1608,6 +1665,98 @@ class SystemOne(unittest.TestCase):
         self.assertAlmostEqual(mass[1], 0.25)
         self.assertAlmostEqual(total, 0.75)
         self.assertEqual((ptoks, cached, model), (12, None, "qwen3.8-test"))
+
+    # ---- sidecar routing (v6.37) --------------------------------------------
+    def test_a_call_named_after_a_sidecar_goes_to_the_sidecar_whole(self):
+        side = _serve(Sidecar)
+        old = self.mod.SIDECARS
+        self.mod.SIDECARS = {"qwen3.5-test-sidecar": f"http://127.0.0.1:{side.server_port}"}
+        try:
+            status, headers, out = self.post(self.quickstart(model="qwen3.5-test-sidecar"))
+        finally:
+            self.mod.SIDECARS = old
+            side.shutdown()
+        self.assertEqual(status, 200, out)
+        self.assertEqual(headers["Content-Type"], "application/json")
+        self.assertEqual(out, Sidecar.ok_body, "the sidecar's own answer, verbatim")
+        self.assertEqual(Engine.seen, [], "the lane was never asked")
+        self.assertEqual(len(Sidecar.seen), 1)
+        self.assertEqual(Sidecar.seen[0]["path"], "/v1/systemone")
+        self.assertEqual(json.loads(Sidecar.seen[0]["body"]),
+                         self.quickstart(model="qwen3.5-test-sidecar"),
+                         "the caller's body, whole, to the sidecar")
+        self.assertEqual(Sidecar.seen[0]["auth"], "Bearer client-token")
+
+    def test_a_sidecar_refusal_comes_back_in_the_route_envelope(self):
+        side = _serve(Sidecar)
+        Sidecar.status = 400
+        old = self.mod.SIDECARS
+        self.mod.SIDECARS = {"qwen3.5-test-sidecar": f"http://127.0.0.1:{side.server_port}"}
+        try:
+            status, _, out = self.post(self.quickstart(model="qwen3.5-test-sidecar"))
+        finally:
+            Sidecar.status = 200
+            self.mod.SIDECARS = old
+            side.shutdown()
+        self.assertEqual(status, 400, out)
+        self.assertEqual(out["detail"]["error_type"], "engine_error")
+        self.assertIn("the sidecar qwen3.5-test-sidecar", out["detail"]["message"])
+        self.assertIn("HTTP 400", out["detail"]["message"])
+        self.assertIn("sidecar's own refusal", out["detail"]["message"])
+
+    def test_a_sidecar_5xx_reads_as_starting_not_as_a_refusal(self):
+        side = _serve(Sidecar)
+        Sidecar.status = 503
+        old = self.mod.SIDECARS
+        self.mod.SIDECARS = {"qwen3.5-test-sidecar": f"http://127.0.0.1:{side.server_port}"}
+        try:
+            status, headers, out = self.post(self.quickstart(model="qwen3.5-test-sidecar"))
+        finally:
+            Sidecar.status = 200
+            self.mod.SIDECARS = old
+            side.shutdown()
+        self.assertEqual(status, 503, out)
+        self.assertEqual(headers.get("Retry-After"), "30")
+        self.assertEqual(out["detail"]["error_type"], "engine_unavailable")
+        self.assertIn("qwen3.5-test-sidecar", out["detail"]["message"])
+
+    def test_a_sidecar_that_is_not_running_is_the_dead_engine_503(self):
+        old = self.mod.SIDECARS
+        self.mod.SIDECARS = {"qwen3.5-test-sidecar": "http://127.0.0.1:9"}
+        try:
+            status, headers, out = self.post(self.quickstart(model="qwen3.5-test-sidecar"))
+        finally:
+            self.mod.SIDECARS = old
+        self.assertEqual(status, 503, out)
+        self.assertEqual(headers.get("Retry-After"), "30")
+        self.assertEqual(out["detail"]["error_type"], "engine_unavailable")
+        self.assertIn("qwen3.5-test-sidecar", out["detail"]["message"])
+        self.assertEqual(Engine.seen, [], "the lane was never asked")
+
+    def test_an_unknown_model_is_refused_as_before_when_sidecars_are_configured(self):
+        side = _serve(Sidecar)
+        old = self.mod.SIDECARS
+        self.mod.SIDECARS = {"qwen3.5-test-sidecar": f"http://127.0.0.1:{side.server_port}"}
+        try:
+            status, _, out = self.post(self.quickstart(model="gpt-4o"))
+        finally:
+            self.mod.SIDECARS = old
+            side.shutdown()
+        self.assertEqual(status, 400, out)
+        self.assertEqual(out["detail"], {"error_type": "api_usage_error",
+                                         "message": "Unknown model: gpt-4o"})
+        self.assertEqual(Engine.seen, [])
+
+    def test_the_sidecars_file_is_parsed_one_line_per_sidecar(self):
+        p = Path(tempfile.mkdtemp(prefix="kproxy-sidecars-")) / "sidecars"
+        p.write_text("# a comment\nqwen3.5-2b-sidecar http://127.0.0.1:3010\n"
+                     "bad line\nqwen3.5-0.8b-sidecar https://host.example:30011\n\n")
+        self.assertEqual(self.mod._load_sidecars(str(p)),
+                         {"qwen3.5-2b-sidecar": "http://127.0.0.1:3010",
+                          "qwen3.5-0.8b-sidecar": "https://host.example:30011"})
+
+    def test_a_missing_sidecars_file_is_an_empty_table(self):
+        self.assertEqual(self.mod._load_sidecars("/nonexistent/qwen38/sidecars"), {})
 
     # ---- the official SDK ----------------------------------------------------
     def test_the_typesafe_sdk_round_trips_against_the_proxy(self):

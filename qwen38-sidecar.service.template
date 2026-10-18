@@ -1,0 +1,27 @@
+[Unit]
+Description=Qwen3.5 small-model sidecar for /v1/systemone (SGLang, text-only), OpenAI+SystemOne API :__PORT__
+Wants=network-online.target
+Requires=docker.service
+# A sidecar is meant to coexist with the serving lane(s): it must NOT stop them,
+# and its own death must not drag the lane down. It only orders after the text
+# lanes so that at boot the lane's memory is settled before the sidecar sizes its
+# KV pool from MemAvailable. No Conflicts= in either direction.
+After=network-online.target docker.service qwen38-sglang.service qwen38-flash.service
+
+[Service]
+Type=simple
+User=__USER__
+Group=__GROUP__
+# Remove a stale instance of this container before starting (a killed -t 20 that
+# left a zombie behind, or a previous manual docker run on the same name).
+ExecStartPre=-/usr/bin/docker rm -f __CONTAINER__
+ExecStart=/bin/bash __HOME__/.config/qwen38/__LAUNCH__
+ExecStop=-/usr/bin/docker stop -t 20 __CONTAINER__
+Restart=always
+# docker kills SGLang with SIGKILL (137) or SIGTERM (143) on a plain stop; that is
+# a clean stop, not a failure (same rule as the text lanes, v1.5.5).
+SuccessExitStatus=137 143
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

@@ -168,6 +168,16 @@ name. It also includes the places where it says no and this endpoint used to say
 one being an unknown model name: `jev-9` is a 400 there and is a 400 here now, instead of being
 quietly answered by the local lane.
 
+**A sidecar takes the calls named after it.** When a small sidecar is installed
+(docs/sidecar.md), this endpoint routes by the model field: a call named
+`qwen3.5-2b-sidecar` or `qwen3.5-0.8b-sidecar` goes whole to that sidecar's own
+`/v1/systemone` and its answer comes back verbatim - since SGLang v0.5.21 the
+endpoint is served by the engine itself, so no part of it runs on this lane,
+not even an admission slot. Every other name (`jev-latest`, the lane's own name,
+a name neither knows) is answered by the lane, as above; a sidecar that is not
+running answers with this lane's own 503 `engine_unavailable`, naming the
+sidecar.
+
 What it is not: a reasoning step by default (the model answers in one token, with thinking off,
 unless `SYSTEMONE_THINK_TOKENS` is set), a vision input (text only, like Jev), or a judgment the
 box makes on its own about your data. Every

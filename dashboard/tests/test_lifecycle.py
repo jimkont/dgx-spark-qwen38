@@ -474,6 +474,13 @@ class FeedOutcomes(unittest.TestCase):
         "CLIENT GONE before the engine answered": "gone",   # v6.31: a stream's caller left while it was queued
         "502 systemone upstream": "fail",
         "529 systemone overloaded": "fail",   # admission: the caller past SYSTEMONE_MAX_CALLS got no answer
+        # v6.37, POST /v1/systemone sidecars: the ok row names the sidecar that
+        # answered (its hole is the name, so the stand-in reads 502); the rest are
+        # the proxy's own failures on the way to or from the sidecar engine
+        "ok systemone sidecar 502": "ok",
+        "503 sidecar unreachable": "fail",
+        "502 sidecar upstream": "fail",
+        "500 sidecar failed": "fail",
     }
 
     @classmethod
@@ -495,7 +502,9 @@ class FeedOutcomes(unittest.TestCase):
             if isinstance(node, ast.Constant) and isinstance(node.value, str):
                 return {node.value}
             if isinstance(node, ast.JoinedStr):
-                # every hole in this proxy's _done() f-strings is an HTTP status
+                # every hole in this proxy's _done() f-strings is an HTTP status or
+                # the answering sidecar's name; the stand-in is arbitrary, the closed
+                # set of whole outcomes is what is checked
                 return {"".join(v.value if isinstance(v, ast.Constant) else "502"
                                 for v in node.values)}
             if isinstance(node, ast.IfExp):
